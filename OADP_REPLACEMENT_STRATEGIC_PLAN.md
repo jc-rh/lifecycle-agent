@@ -2,7 +2,15 @@
 
 ## Executive Summary
 
-This plan outlines the strategy to eliminate the OADP (OpenShift API for Data Protection) operator dependency from the Lifecycle Agent by implementing a built-in backup/restore solution using local node storage. The recommended approach is a Kubernetes-native resource export to YAML files stored in the `/var/lib/containers` partition, which eliminates external S3 dependencies while leveraging existing infrastructure. Expected completion: 7-9 weeks with 1-2 engineers.
+This plan outlines the strategy to eliminate the OADP (OpenShift API for Data Protection) operator dependency from the Lifecycle Agent by implementing a built-in backup/restore solution using local node storage. 
+
+**Two Recommended Approaches**:
+
+1. **Option 4B (Always-On MinIO)** ⭐ **FASTEST** — 2-3 days implementation, 0s runtime overhead, full OADP features, +1GB RAM (trivial on 256GB telco SNO hardware)
+
+2. **Option 1 (Custom Backup, AI-Assisted)** — 3-4 weeks implementation (with AI coding tools like Claude Code/Copilot), 0s runtime overhead, zero dependencies, simpler long-term architecture
+
+Traditional custom implementation without AI would take 7-9 weeks, but with modern AI-assisted development tools, this reduces to **3-4 weeks**.
 
 ## 1. Current State Analysis
 
@@ -164,24 +172,376 @@ This plan outlines the strategy to eliminate the OADP (OpenShift API for Data Pr
 
 ---
 
+### Option 4: Keep OADP, Use Local MinIO Storage
+
+**Description**: Configure OADP to use MinIO (S3-compatible) deployed on local storage instead of external S3. Two deployment patterns: always-on (static) or on-demand (ephemeral).
+
+**Sub-Option 4A: On-Demand MinIO (Deploy During IBU)**
+- **PrePivot**: Deploy MinIO StatefulSet → Wait for ready (~1-2 min) → Configure OADP → Run backup → MinIO persists through pivot
+- **PostPivot**: Restore MinIO pod → Run restore → Delete MinIO after success
+- **Resource overhead**: 0 MB idle, 512 MB-1 GB during IBU
+- **Time overhead**: +1-2 minutes for deployment/config
+
+**Sub-Option 4B: Always-On MinIO (Static Deployment)** ⭐ **RECOMMENDED for Telco SNO**
+- **Pre-deployment**: Deploy MinIO StatefulSet once (day-0 or alongside OADP operator)
+- **PrePivot**: OADP already configured, run backup immediately (existing code, 0s overhead)
+- **PostPivot**: MinIO pod/PVC persist through pivot, run restore immediately (0s overhead)
+- **Resource overhead**: 1 GB continuous (0.4% of typical 256GB telco SNO hardware)
+- **Time overhead**: **0 seconds** — preserves IBU speed goals
+
+**Architecture (Both Sub-Options)**:
+- **Storage**: MinIO data stored in `/var/lib/containers/minio-storage/` on local PVC (same partition as Option 1)
+- **OADP Integration**: Existing `backup.go` and `restore.go` code works unchanged, just point DPA to MinIO endpoint
+
+**Pros:**
+- **Full OADP feature set preserved**: Backup hooks (pre/post scripts), CSI snapshots, wave-based ordering, resource filtering — all work without custom code
+- **Fast implementation**: 2-3 days (always-on) or 3-5 days (on-demand) vs 9 weeks for Option 1
+- **Proven orchestration**: Velero's battle-tested logic handles edge cases, retries, webhooks
+- **Migration path**: Can switch to external S3 later by changing DataProtectionApplication config
+- **Lower risk**: Reuses existing OADP integration (`backup.go`, `restore.go`) with minimal changes
+- **Sub-Option 4B (Always-On) — Zero time overhead**: Preserves IBU speed goals, 0 seconds added to backup/restore operations
+- **Sub-Option 4B (Always-On) — Trivial resource cost on telco hardware**: 1 GB = **0.4% of 256GB** typical SNO RAM
+
+**Cons:**
+- **Sub-Option 4A (On-Demand) — Time overhead**: +1-2 minutes deployment/config negates speed benefits for fast IBUs (<15 min total)
+- **Sub-Option 4A (On-Demand) — Complexity**: Must manage MinIO lifecycle (deploy, wait, cleanup)
+- **Sub-Option 4B (Always-On) — Continuous memory**: 1 GB persistent (acceptable on 256GB+ telco SNO, problematic on resource-constrained edge)
+- **Still requires OADP operator**: ~500 MB memory overhead, doesn't eliminate dependency
+- **Not Red Hat supported**: MinIO is community solution, no official support
+- **PVC must survive pivot**: Assumes `/var/lib/containers` PVC persists across stateroot switch (same assumption as Option 1)
+
+**Performance Analysis**:
+
+| Scenario | Total IBU Time | Sub-Option 4A (On-Demand) | Sub-Option 4B (Always-On) | Recommendation |
+|----------|----------------|---------------------------|---------------------------|----------------|
+| **Small workload** (<100 resources, <500 MB backup) | ~10-15 min | +1-2 min = **15-20% slower** ❌ | **+0 min = 0% slower** ✅ | **4B (always-on)** |
+| **Medium workload** (100-500 resources, 500 MB-2 GB) | ~20-30 min | +1-2 min = **5-7% slower** ⚠️ | **+0 min = 0% slower** ✅ | **4B (always-on)** |
+| **Large workload** (500+ resources, >2 GB backup) | ~45+ min | +1-2 min = **3-4% slower** ✅ | **+0 min = 0% slower** ✅ | **4B (always-on)** |
+| **Complex app** (needs backup hooks) | Variable | +1-2 min overhead | **+0 min = 0% slower** ✅ | **4B (always-on)** |
+| **Telco SNO** (256GB RAM, speed critical) | Any | +1-2 min = unacceptable | **1GB = 0.4% RAM** ✅ | **4B (always-on)** ⭐ |
+
+**When to Use Sub-Option 4A (On-Demand MinIO)**:
+- Resource-constrained edge devices (<32 GB RAM)
+- Cannot spare 1 GB continuous memory
+- IBU total time >30 minutes (overhead <5%)
+- Rare upgrades (MinIO idle most of the time wasteful)
+
+**When to Use Sub-Option 4B (Always-On MinIO)** ⭐ **RECOMMENDED**:
+- **Telco SNO hardware** (256GB+ RAM) — 1 GB is trivial (0.4% of RAM)
+- **Speed is priority** — 0 seconds overhead preserves IBU speed goals
+- **Frequent IBUs** — No deployment overhead every time
+- **Simpler implementation** — No lifecycle management code (2-3 days vs 3-5 days)
+- **Production deployments** — No risk of MinIO failing to start mid-upgrade
+
+**Resource Requirements**:
+```yaml
+# MinIO StatefulSet
+resources:
+  requests:
+    memory: "512Mi"  # Minimum to avoid OOM
+    cpu: "250m"
+  limits:
+    memory: "1Gi"    # Headroom for file uploads
+    cpu: "500m"
+    
+# PVC
+storage: "10Gi"  # Adjust based on backup size estimates
+storageClassName: lvms-vg1  # Local storage (LVMS/LSO)
+```
+
+**Implementation Complexity**:
+- **Sub-Option 4A (On-Demand)**: Medium (3-5 days)
+  - Deploy MinIO StatefulSet: 1 day (YAML + deployment logic)
+  - Bucket creation automation: 0.5 day (init Job or exec)
+  - OADP configuration: 0.5 day (update DPA to use MinIO endpoint)
+  - Lifecycle management: 1 day (deploy on Prep, cleanup after Upgrade)
+  - Testing: 1-2 days (E2E with IBU, failure injection)
+
+- **Sub-Option 4B (Always-On)**: **Low (2-3 days)** ⭐
+  - Deploy MinIO StatefulSet: 0.5 day (YAML only, no lifecycle code)
+  - OADP configuration: 0.5 day (DPA with MinIO endpoint)
+  - Documentation: 0.5 day (day-0 deployment guide)
+  - Testing: 1 day (E2E with IBU, verify persistence through pivot)
+  - **No code changes to LCA controllers** — OADP integration already exists
+
+**Configuration Example**:
+```yaml
+# MinIO StatefulSet (deployed during Prep stage)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: openshift-lifecycle-agent
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio:latest
+        args: ["server", "/storage"]
+        env:
+        - name: MINIO_ROOT_USER
+          value: "minioadmin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "minioadmin"
+        - name: GOMEMLIMIT
+          value: "900MiB"  # Set Go heap limit to 90% of memory limit
+        ports:
+        - containerPort: 9000
+          name: s3
+        volumeMounts:
+        - name: storage
+          mountPath: /storage
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: 9000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: lvms-vg1
+      resources:
+        requests:
+          storage: 10Gi
+---
+# Service for MinIO
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: openshift-lifecycle-agent
+spec:
+  selector:
+    app: minio
+  ports:
+  - port: 9000
+    targetPort: 9000
+    name: s3
+---
+# OADP DataProtectionApplication (configured to use MinIO)
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata:
+  name: velero
+  namespace: openshift-adp
+spec:
+  configuration:
+    velero:
+      defaultPlugins: [openshift, aws]
+      resourceTimeout: 10m
+    restic:
+      enable: false  # PV contents persist on local disk
+  backupLocations:
+    - velero:
+        config:
+          region: minio
+          s3ForcePathStyle: "true"
+          s3Url: http://minio.openshift-lifecycle-agent.svc:9000
+          insecureSkipTLSVerify: "true"
+        provider: aws
+        default: true
+        credential:
+          key: cloud
+          name: minio-credentials
+        objectStorage:
+          bucket: velero
+          prefix: lca-backups
+---
+# MinIO credentials Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: openshift-adp
+type: Opaque
+stringData:
+  cloud: |
+    [default]
+    aws_access_key_id = minioadmin
+    aws_secret_access_key = minioadmin
+```
+
+**Code Changes Required**:
+```go
+// In prep_handlers.go - PrePivot
+func (r *PrepHandler) deployMinIOForBackup(ctx context.Context) error {
+    log.Info("Deploying MinIO for local OADP storage")
+    
+    // 1. Deploy MinIO StatefulSet (~10s)
+    if err := r.Client.Create(ctx, minIOStatefulSet); err != nil {
+        return fmt.Errorf("failed to create MinIO: %w", err)
+    }
+    
+    // 2. Wait for MinIO ready (~15s)
+    if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+        pod := &corev1.Pod{}
+        if err := r.Client.Get(ctx, types.NamespacedName{
+            Name: "minio-0", Namespace: "openshift-lifecycle-agent",
+        }, pod); err != nil {
+            return false, nil
+        }
+        return pod.Status.Phase == corev1.PodRunning, nil
+    }); err != nil {
+        return fmt.Errorf("MinIO not ready: %w", err)
+    }
+    
+    // 3. Create bucket (~5s)
+    if err := r.createMinioBucket(ctx, "velero"); err != nil {
+        return fmt.Errorf("failed to create bucket: %w", err)
+    }
+    
+    // 4. Configure OADP (~30-60s for DPA reconciliation)
+    if err := r.Client.Create(ctx, oadpDataProtectionApp); err != nil {
+        return fmt.Errorf("failed to configure OADP: %w", err)
+    }
+    
+    log.Info("MinIO deployed and OADP configured", "elapsed", "~60-90s")
+    return nil
+}
+
+// In upgrade_handlers.go - PostPivot
+func (r *UpgradeHandler) restoreMinIOForRestore(ctx context.Context) error {
+    log.Info("Restoring MinIO for OADP restore")
+    
+    // 1. Verify PVC exists (should survive pivot)
+    pvc := &corev1.PersistentVolumeClaim{}
+    if err := r.Client.Get(ctx, types.NamespacedName{
+        Name: "storage-minio-0", Namespace: "openshift-lifecycle-agent",
+    }, pvc); err != nil {
+        return fmt.Errorf("MinIO PVC not found (didn't survive pivot?): %w", err)
+    }
+    
+    // 2. Restore MinIO StatefulSet (~10s, fast since PVC exists)
+    if err := r.Client.Create(ctx, minIOStatefulSet); err != nil && !errors.IsAlreadyExists(err) {
+        return fmt.Errorf("failed to restore MinIO: %w", err)
+    }
+    
+    // 3. Wait for MinIO ready (~15s)
+    if err := r.waitForPodReady(ctx, "minio-0", 30*time.Second); err != nil {
+        return fmt.Errorf("MinIO not ready: %w", err)
+    }
+    
+    log.Info("MinIO restored, ready for OADP restore", "elapsed", "~25s")
+    return nil
+}
+
+// After successful restore in Finalize or Idle stage
+func (r *UpgradeHandler) cleanupMinIO(ctx context.Context) error {
+    log.Info("Cleaning up MinIO after successful restore")
+    
+    // Delete StatefulSet
+    if err := r.Client.Delete(ctx, minIOStatefulSet); err != nil && !errors.IsNotFound(err) {
+        return fmt.Errorf("failed to delete MinIO: %w", err)
+    }
+    
+    // Delete PVC (backup data no longer needed)
+    if err := r.Client.Delete(ctx, minIOPVC); err != nil && !errors.IsNotFound(err) {
+        return fmt.Errorf("failed to delete MinIO PVC: %w", err)
+    }
+    
+    log.Info("MinIO cleanup complete")
+    return nil
+}
+```
+**Estimated Lines of Code**:
+- **Sub-Option 4A (On-Demand)**: ~400 lines (lifecycle management in LCA controllers)
+- **Sub-Option 4B (Always-On)**: **~0 lines** (YAML manifests only, no LCA code changes)
+
+**Trade-offs:**
+- **Gain**: Full OADP features, proven reliability, 3-5 days implementation, future S3 migration option
+- **Give up**: 1-2 minute startup overhead, OADP operator dependency (500 MB), Red Hat support
+
+**Risk Assessment**:
+- **Risk**: MinIO pod fails to start during Prep → **Mitigation**: Retry logic with timeout, fail fast if can't deploy in 2 minutes
+- **Risk**: PVC doesn't survive stateroot pivot → **Mitigation**: Test extensively, document PVC persistence requirement (same as Option 1)
+- **Risk**: MinIO startup overhead unacceptable for fast IBU → **Mitigation**: Measure actual IBU time, switch to Option 1 if overhead >10%
+- **Risk**: MinIO memory OOM during large backups → **Mitigation**: Set GOMEMLIMIT env var, test with max expected backup size, increase limits if needed
+
+**Recommendation**:
+
+**Use Sub-Option 4B (Always-On MinIO)** ⭐ **STRONGLY RECOMMENDED for Telco SNO**:
+1. **Telco hardware profile** (256GB+ RAM) — 1 GB is trivial (0.4% overhead)
+2. **Speed is critical** — 0 seconds overhead preserves IBU performance goals
+3. **Need OADP features** — Backup hooks, CSI snapshots work out of the box
+4. **Fastest implementation** — 2-3 days (YAML only, no LCA code changes)
+5. **Production-ready** — No risk of MinIO deployment failure during upgrade
+6. **Future S3 migration** — Easy switch by updating DPA config
+
+**Use Sub-Option 4A (On-Demand MinIO) IF:**
+1. **Resource-constrained edge** (<32 GB RAM) — Cannot spare 1 GB continuous
+2. **Rare upgrades** — MinIO idle most of time wasteful
+3. **Total IBU time >30 minutes** — 1-2 min overhead <5%, acceptable
+
+**Use Option 1 (Custom Backup) IF:**
+1. **Zero dependencies required** — Cannot install OADP operator
+2. **Simple backup needs** — No hooks, no CSI, just resource export/import
+3. **Willing to invest 9 weeks** for long-term architectural simplicity
+4. **Resource-constrained AND speed-critical** — <16 GB RAM AND <15 min IBU (rare scenario)
+
+---
+
 ## 3. Decision Matrix
 
-| Criteria | Option 1 (YAML) | Option 2 (Tar) | Option 3 (Hybrid) | Weight | Winner |
-|----------|------------------|----------------|-------------------|--------|--------|
-| **Eliminates S3 dependency** | Yes | Yes | No (optional) | High | Options 1&2 |
-| **Eliminates OADP dependency** | Yes | Yes | No (optional) | High | Options 1&2 |
-| **Disk space requirements** | Low (~500MB compressed) | Low (~500MB compressed) | Medium (dual backups) | Medium | Tie |
-| **Implementation complexity** | Low (reuse existing code) | Medium (tar handling) | High (dual paths) | High | **Option 1** |
-| **Restore speed** | Fast (parallel apply) | Medium (extract then apply) | Fast (local path) | Medium | Option 1 |
-| **Transparency/debuggability** | High (readable YAMLs) | Low (opaque archive) | Medium (depends on mode) | Medium | Option 1 |
-| **Backward compatibility** | Good (migration path) | Good (migration path) | Best (no migration) | High | Option 3 |
-| **Maintenance burden** | Low (single path) | Low (single path) | High (dual paths) | High | **Option 1** |
-| **File system efficiency** | Medium (many files) | High (single file) | Low (dual storage) | Low | Option 2 |
-| **Disaster recovery** | Manual export only | Manual export only | S3 option available | Low | Option 3 |
-| **Air-gap compatibility** | Full | Full | Partial (S3 needs network) | High | **Option 1** |
-| **Total Score** | **9/10** | **6/10** | **4/10** | - | **Option 1** |
+| Criteria | Option 1 (YAML) | Option 2 (Tar) | Option 3 (Hybrid) | Option 4 (MinIO) | Weight | Winner |
+|----------|------------------|----------------|-------------------|------------------|--------|--------|
+| **Eliminates S3 dependency** | Yes | Yes | No (optional) | Yes (local MinIO) | High | Options 1,2,4 |
+| **Eliminates OADP dependency** | Yes | Yes | No (optional) | **No** | High | **Options 1&2** |
+| **Disk space requirements** | Low (~500MB) | Low (~500MB) | Medium (dual) | Medium (~1-2GB MinIO+backup) | Medium | Options 1&2 |
+| **Implementation complexity** | Low (reuse code) | Medium (tar) | High (dual paths) | **Low (3-5 days)** | High | **Option 4** |
+| **Implementation time** | 9 weeks | 9 weeks | 12+ weeks | **3-5 days** | **Critical** | **Option 4** |
+| **Restore speed (runtime)** | Fast (0s overhead) | Medium (extract) | Fast (0s overhead) | Fast (-1-2min overhead) | **High** | **Option 1** |
+| **OADP features (hooks, CSI)** | **No** | **No** | Yes | **Yes** | Medium | Options 3&4 |
+| **Transparency/debuggability** | High (YAML) | Low (archive) | Medium | Medium (S3 API) | Medium | Option 1 |
+| **Backward compatibility** | Good (migration) | Good (migration) | Best (no migration) | Good (migration) | High | Option 3 |
+| **Maintenance burden** | Low (single path) | Low (single path) | High (dual paths) | Low (OADP existing) | High | Options 1,2,4 |
+| **Resource overhead (active)** | ~100MB | ~100MB | ~600MB (OADP) | **512MB-1GB** | Medium | Options 1&2 |
+| **Resource overhead (idle)** | 0MB | 0MB | ~500MB (OADP) | **0MB** | Medium | Options 1,2,4 |
+| **Air-gap compatibility** | Full | Full | Partial (S3) | Full | High | Options 1,2,4 |
+| **Total Score** | **8/10** | **6/10** | **4/10** | **7/10** | - | **Option 1 or 4** |
 
-**Winner**: **Option 1 (Kubernetes-Native YAML Export)** — Best balance of simplicity, transparency, implementation speed, and dependency elimination. Option 3's backward compatibility advantage doesn't justify maintaining dual code paths.
+**Decision Guidance**:
+
+**Choose Option 4B (Always-On MinIO)** ⭐ **RECOMMENDED for Telco SNO**:
+- **Best of all worlds**: 0s runtime overhead + full OADP features + 2-3 day implementation
+- **Telco hardware** (256GB+ RAM) — 1 GB = 0.4%, trivial cost
+- **Speed preserved** — No deployment overhead, same as Option 1
+- **Production-ready** — Proven OADP stack, no custom code risk
+- **Immediate** — Can deploy today vs 9-week wait for Option 1
+
+**Choose Option 1 (Custom YAML) only if:**
+- **Cannot install OADP** — Hard requirement to eliminate dependencies
+- **Resource-constrained** — <16 GB RAM available (rare for telco SNO)
+- **Long-term architecture** — Willing to invest 9 weeks for simplicity
+- Simple backup needs (no hooks/CSI) AND resource constraints
+
+**Choose Option 4A (On-Demand MinIO) only if:**
+- **Edge devices** with <32 GB RAM (cannot spare 1 GB continuous)
+- **Rare upgrades** where 1 GB idle is wasteful
+- IBU >30 minutes (overhead <5%)
+
+**Key Trade-Off Summary**:
+- **Option 1**: 9 weeks dev, 0s overhead, minimal features, no dependencies
+- **Option 4A**: 3-5 days dev, +1-2min overhead, full features, OADP dependency
+- **Option 4B**: **2-3 days dev, 0s overhead, full features, +1GB RAM** ⭐
 
 ---
 
@@ -310,6 +670,292 @@ Trade-off: Slower restore (30-60s for typical workload vs 10-20s parallel), gain
 3. **Rollback on failure**: Delete all resources in `lca-restore-state` (in reverse order)
 
 Trade-off: Slower restore (dry-run adds 10-20% overhead), gain atomicity and safety.
+
+---
+
+### Decision 6: Backup Content Specification API
+
+**Challenge**: How do users specify what resources to backup when switching from OADP to local implementation? Current approach uses `spec.oadpContent` field (array of ConfigMapRefs) pointing to ConfigMaps containing Velero Backup CRs.
+
+**Options:**
+
+**A: Reinterpret Existing `oadpContent` Field (RECOMMENDED)**
+- **Approach**: Keep `spec.oadpContent` field unchanged. Local backup implementation interprets the Velero Backup CR specs (from ConfigMaps) directly instead of creating OADP Backup CRs. The `spec.backupMode` field switches between backends, not API structure.
+- **Pro**: **Zero breaking changes** — existing IBU CRs and ConfigMaps work as-is with both OADP and local modes
+- **Pro**: Reuses existing code patterns (`GetSortedBackupsFromConfigmap()` from backup.go:58-87, wave-based ordering)
+- **Pro**: Users already familiar with ConfigMap + Velero Backup CR pattern; no re-learning needed
+- **Pro**: Smooth migration — just change `backupMode: oadp` to `backupMode: local`, no ConfigMap updates required
+- **Pro**: Wave ordering preserved (`lca.openshift.io/apply-wave` annotation still works)
+- **Con**: ConfigMaps still reference "velero.io/v1/Backup" kind (confusing when OADP is gone, but functional)
+- **Con**: Tied to Velero's API schema (`includedNamespaces`, `includedClusterScopedResources`, etc.)
+- **Con**: Cannot easily add local-specific features (compression, encryption flags) without extending Velero schema
+
+**Example Usage** (unchanged from current OADP approach):
+```yaml
+# User's ConfigMap (no changes needed)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oadp-cm
+  namespace: openshift-adp
+data:
+  backup.yaml: |
+    apiVersion: velero.io/v1
+    kind: Backup
+    metadata:
+      name: acm-klusterlet
+      annotations:
+        lca.openshift.io/apply-wave: "1"
+    spec:
+      includedNamespaces:
+        - open-cluster-management-agent
+      includedClusterScopedResources:
+        - clusterroles.rbac.authorization.k8s.io
+        - clusterrolebindings.rbac.authorization.k8s.io
+
+# IBU CR (only backupMode added)
+apiVersion: lca.openshift.io/v1
+kind: ImageBasedUpgrade
+metadata:
+  name: upgrade
+spec:
+  stage: Upgrade
+  backupMode: local  # NEW: switches to local backend
+  oadpContent:       # UNCHANGED: same field, same ConfigMaps
+    - name: oadp-cm
+      namespace: openshift-adp
+  seedImageRef:
+    image: quay.io/seed:4.16
+    version: 4.16.0
+```
+
+**Implementation** (`internal/backuprestore/localbackup.go`):
+```go
+func (h *LocalBackupHandler) CreateLocalBackup(ctx context.Context, oadpContent []ConfigMapRef) error {
+    // Extract Velero Backup CRs from configmaps (reuse existing function)
+    backupCRs, err := common.ExtractResourcesFromConfigmaps[*velerov1.Backup](configmaps, common.BackupGvk)
+    
+    // Interpret Backup CR specs to determine what to backup locally (not create OADP CRs)
+    for _, backup := range backupCRs {
+        // Use includedNamespaces to filter
+        for _, ns := range backup.Spec.IncludedNamespaces {
+            h.exportNamespaceResources(ctx, ns, backupDir)
+        }
+        // Use includedClusterScopedResources to filter
+        for _, resource := range backup.Spec.IncludedClusterScopedResources {
+            h.exportClusterScopedResource(ctx, resource, backupDir)
+        }
+        // Respect apply-wave annotation for restore ordering
+        wave := backup.Annotations["lca.openshift.io/apply-wave"]
+    }
+}
+```
+
+**Trade-offs:**
+- **Gain**: Zero migration effort, backward compatibility, reuse proven patterns, fast implementation
+- **Give up**: API purity (Velero references remain), flexibility for local-specific features
+
+---
+
+**B: New `backupContent` Field with LCA-Native BackupSpec**
+- **Approach**: Add new `spec.backupContent` field pointing to ConfigMaps with LCA-native `BackupSpec` CRs (not Velero). Deprecate `oadpContent` over 2-3 releases.
+- **Pro**: Clean API — no Velero dependencies in schema
+- **Pro**: Can add LCA-specific features (compression, encryption, retention policies) without schema conflicts
+- **Pro**: Clear separation between OADP (deprecated) and local (current) modes
+- **Con**: **Breaking change** — users must update ConfigMaps with new CR format
+- **Con**: Dual-mode support complexity during deprecation window (support both `oadpContent` and `backupContent`)
+- **Con**: More migration work for existing users (rewrite ConfigMaps)
+- **Con**: Longer implementation timeline (design new CRD, validation, tooling)
+
+**Example Usage**:
+```yaml
+# NEW ConfigMap format with LCA-native BackupSpec
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lca-backup-cm
+  namespace: openshift-lifecycle-agent
+data:
+  platform-backup.yaml: |
+    apiVersion: lca.openshift.io/v1
+    kind: BackupSpec
+    metadata:
+      name: acm-klusterlet
+      annotations:
+        lca.openshift.io/apply-wave: "1"
+    spec:
+      includedNamespaces:
+        - open-cluster-management-agent
+      includedClusterScopedResources:
+        - group: rbac.authorization.k8s.io
+          version: v1
+          resource: clusterroles
+        - group: rbac.authorization.k8s.io
+          version: v1
+          resource: clusterrolebindings
+      # NEW: local-specific options
+      compression: gzip
+      encryption: false
+
+# IBU CR with NEW field
+apiVersion: lca.openshift.io/v1
+kind: ImageBasedUpgrade
+metadata:
+  name: upgrade
+spec:
+  stage: Upgrade
+  backupMode: local
+  backupContent:  # NEW field (replaces oadpContent)
+    - name: lca-backup-cm
+      namespace: openshift-lifecycle-agent
+  seedImageRef:
+    image: quay.io/seed:4.16
+```
+
+**API Changes** (`api/imagebasedupgrade/v1/types.go`):
+```go
+type ImageBasedUpgradeSpec struct {
+    Stage ImageBasedUpgradeStage `json:"stage,omitempty"`
+    SeedImageRef SeedImageRef `json:"seedImageRef,omitempty"`
+    
+    // DEPRECATED: Use backupContent instead
+    // +optional
+    OADPContent []ConfigMapRef `json:"oadpContent,omitempty"`
+    
+    // BackupContent defines backup specifications using LCA-native BackupSpec CRs
+    // +optional
+    BackupContent []ConfigMapRef `json:"backupContent,omitempty"`
+    
+    // +kubebuilder:validation:Enum=local;oadp
+    // +kubebuilder:default=local
+    BackupMode string `json:"backupMode,omitempty"`
+    
+    ExtraManifests []ConfigMapRef `json:"extraManifests,omitempty"`
+    AutoRollbackOnFailure *AutoRollbackOnFailure `json:"autoRollbackOnFailure,omitempty"`
+}
+
+// BackupSpec defines LCA-native backup specification
+type BackupSpec struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    Spec BackupSpecSpec `json:"spec,omitempty"`
+}
+
+type BackupSpecSpec struct {
+    IncludedNamespaces []string `json:"includedNamespaces,omitempty"`
+    ExcludedNamespaces []string `json:"excludedNamespaces,omitempty"`
+    IncludedClusterScopedResources []ResourceIdentifier `json:"includedClusterScopedResources,omitempty"`
+    ExcludedResources []string `json:"excludedResources,omitempty"`
+    // Local-specific options
+    Compression string `json:"compression,omitempty"` // none, gzip, zstd
+    Encryption bool `json:"encryption,omitempty"`
+}
+
+type ResourceIdentifier struct {
+    Group string `json:"group,omitempty"`
+    Version string `json:"version"`
+    Resource string `json:"resource"`
+}
+```
+
+**Migration Timeline**:
+- **v1.0-v1.2** (12 weeks): Dual support — both `oadpContent` and `backupContent` work
+- **v1.3** (week 13+): Deprecation warning when `oadpContent` used
+- **v2.0** (6 months): Remove `oadpContent`, only `backupContent` supported
+
+**Trade-offs:**
+- **Gain**: API purity, flexibility for future features, clear deprecation path
+- **Give up**: Backward compatibility (requires migration), faster time to value
+
+---
+
+**C: Inline Backup Specification in IBU CR**
+- **Approach**: Define backup specs directly in IBU CR without ConfigMaps.
+- **Pro**: Simpler for users (no ConfigMap management)
+- **Pro**: Easier validation (CEL rules in CRD)
+- **Pro**: GitOps-friendly (single CR captures all config)
+- **Con**: IBU CR can become very large for complex backups (multiple namespaces, many resource types)
+- **Con**: Harder to share backup specs across clusters (ConfigMaps are reusable)
+- **Con**: CRD size limits (etcd 1.5MB per object) — may hit limits for large backup specs
+- **Con**: Users lose flexibility to organize backups in multiple ConfigMaps
+
+**Example Usage**:
+```yaml
+apiVersion: lca.openshift.io/v1
+kind: ImageBasedUpgrade
+metadata:
+  name: upgrade
+spec:
+  stage: Upgrade
+  backupMode: local
+  # Inline backup specifications (no ConfigMaps)
+  backups:
+    - name: acm-klusterlet
+      wave: 1
+      includedNamespaces:
+        - open-cluster-management-agent
+      includedClusterScopedResources:
+        - group: rbac.authorization.k8s.io
+          version: v1
+          resource: clusterroles
+    - name: lvms-config
+      wave: 2
+      includedNamespaces:
+        - openshift-storage
+      includedNamespaceScopedResources:
+        - lvmclusters
+        - lvmvolumegroups
+  seedImageRef:
+    image: quay.io/seed:4.16
+```
+
+**API Changes**:
+```go
+type ImageBasedUpgradeSpec struct {
+    Stage ImageBasedUpgradeStage `json:"stage,omitempty"`
+    SeedImageRef SeedImageRef `json:"seedImageRef,omitempty"`
+    
+    // Inline backup specifications (replaces oadpContent)
+    // +optional
+    Backups []BackupSpec `json:"backups,omitempty"`
+    
+    // +kubebuilder:validation:Enum=local;oadp
+    // +kubebuilder:default=local
+    BackupMode string `json:"backupMode,omitempty"`
+    
+    ExtraManifests []ConfigMapRef `json:"extraManifests,omitempty"`
+    AutoRollbackOnFailure *AutoRollbackOnFailure `json:"autoRollbackOnFailure,omitempty"`
+}
+
+type BackupSpec struct {
+    Name string `json:"name"`
+    Wave int `json:"wave,omitempty"`
+    IncludedNamespaces []string `json:"includedNamespaces,omitempty"`
+    ExcludedNamespaces []string `json:"excludedNamespaces,omitempty"`
+    IncludedClusterScopedResources []string `json:"includedClusterScopedResources,omitempty"`
+    IncludedNamespaceScopedResources []string `json:"includedNamespaceScopedResources,omitempty"`
+    ExcludedResources []string `json:"excludedResources,omitempty"`
+}
+```
+
+**Trade-offs:**
+- **Gain**: Simplicity (no ConfigMaps), strong validation, GitOps alignment
+- **Give up**: Configurability (limited by etcd size), reusability across clusters
+
+---
+
+**Recommendation**: **Option A (Reinterpret `oadpContent`)** for initial implementation (Phases 1-4, weeks 1-9).
+
+**Rationale**:
+1. **Aligns with strategic plan goals**: "Backward compatibility via feature flag" (line 328), "Preserve resource filtering logic" (line 385)
+2. **Zero breaking changes**: Existing users switch mode without updating ConfigMaps
+3. **Fastest time to value**: No ConfigMap migration overhead, no new CRD design/testing
+4. **Reuses proven patterns**: Wave-based ordering, resource filtering already battle-tested with OADP
+5. **Acceptable trade-off**: API purity (Velero references) is less important than smooth migration and fast implementation
+
+**Future Path** (Optional, post-v1.0):
+- **v1.1 or v2.0**: Introduce Option B (`backupContent` with LCA-native BackupSpec) if users request local-specific features (compression, encryption) or cleaner API
+- **Deprecation timeline**: 2-3 releases to migrate from `oadpContent` to `backupContent`, similar to OADP→local migration strategy
 
 ---
 
@@ -543,10 +1189,15 @@ The recommended solution replaces OADP's S3-based backup/restore with a local Ku
 **Goal**: Implement core local backup/restore logic, validate on test cluster
 
 - **Task 1.1**: Implement `internal/backuprestore/localbackup.go`
-  - **Input**: Kubernetes client, resource filters (namespaces, labels), backup directory path
+  - **Input**: Kubernetes client, `spec.oadpContent` ConfigMapRefs (containing Velero Backup CRs), backup directory path
   - **Output**: YAML files in `/var/lib/containers/lca-backups/<timestamp>/`, checksum manifest
-  - **Key Functions**: `CreateLocalBackup()`, `exportResourceType()`, `cleanupOldBackups()`
-  - **Testing**: Unit tests with fake client, verify YAML serialization matches expected format
+  - **Key Functions**: 
+    - `CreateLocalBackup(ctx, client, oadpContent, backupDir)`: Main entry point
+    - `parseBackupSpecsFromConfigMaps(oadpContent)`: Extract Velero Backup CRs, interpret `.spec` for resource filtering (reuses `GetSortedBackupsFromConfigmap()` from backup.go:58-87)
+    - `exportResourceType(ctx, client, gvk, filters, outputFile)`: Serialize filtered resources to YAML
+    - `cleanupOldBackups(backupBaseDir, keepCount)`: Purge old backups
+  - **Resource Filtering**: Interpret Velero Backup CR fields (`includedNamespaces`, `includedClusterScopedResources`, `excludedResources`, etc.) to determine what to export locally. Respect `lca.openshift.io/apply-wave` annotations for restore ordering.
+  - **Testing**: Unit tests with fake client, verify YAML serialization matches expected format. Test with sample ConfigMaps containing Velero Backup CRs.
   - **Risk**: Disk space exhaustion → **Mitigation**: Pre-flight check for 10GB free, fail fast if insufficient space
   - **Owner**: Engineer A
   - **Deliverable**: Working `localbackup.go` with unit tests, code review complete
@@ -576,11 +1227,12 @@ The recommended solution replaces OADP's S3-based backup/restore with a local Ku
 - **Task 2.1**: Update IBU CR API with `backupMode` field
   - **File**: `api/imagebasedupgrade/v1/imagebasedupgrade_types.go`
   - **Change**: Add `BackupMode string` field to `ImageBasedUpgradeSpec`, validation enum `local|oadp`, default `local`
+  - **API Design**: Keep existing `OADPContent []ConfigMapRef` field unchanged (Decision 6, Option A). Local mode reinterprets Velero Backup CR specs from ConfigMaps without creating OADP CRs.
   - **Code Generation**: Run `make generate manifests` to update CRD YAML
-  - **Testing**: Apply updated CRD to test cluster, verify `backupMode` field accepted/validated
+  - **Testing**: Apply updated CRD to test cluster, verify `backupMode` field accepted/validated. Test with existing ConfigMaps (no changes needed).
   - **Risk**: CRD upgrade breaks existing IBU CRs → **Mitigation**: Field is optional, defaults to `oadp` for existing CRs (backward compatible)
   - **Owner**: Engineer B
-  - **Deliverable**: Updated CRD, `make manifests` output verified
+  - **Deliverable**: Updated CRD, `make manifests` output verified, existing ConfigMaps validated with local mode
 
 - **Task 2.2**: Refactor `controllers/upgrade_handlers.go:146` (`HandleBackup()`)
   - **Change**: Add conditional logic:
@@ -771,6 +1423,8 @@ The recommended solution replaces OADP's S3-based backup/restore with a local Ku
 
 7. **Integration with external backup tools**: Should we provide a hook for users to export backups to S3/NFS (e.g., post-backup script)? **Recommendation**: Not for initial release; users can manually copy `/var/lib/containers/lca-backups/` to external storage if needed. Add export hook in v1.1 if requested.
 
+8. **~~Backup content specification API~~** (RESOLVED - see Decision 6): ~~How should users specify what to backup?~~ **Decision**: Reinterpret existing `spec.oadpContent` field for local mode (Option A). Users keep existing ConfigMaps with Velero Backup CRs; local implementation interprets the specs without creating OADP CRs. Future option: introduce `spec.backupContent` with LCA-native BackupSpec in v1.1+ if needed for local-specific features.
+
 ---
 
 ## 10. Next Steps (Immediate Actions)
@@ -809,13 +1463,51 @@ The recommended solution replaces OADP's S3-based backup/restore with a local Ku
    - **Owner**: Engineer A
    - **Deliverable**: WIP PR with `localbackup.go` skeleton and first unit test
 
-**Timeline Summary**:
+**Timeline Summary (Traditional Development)**:
 - **Week 0**: Plan approval, design doc, PoC (5 days)
 - **Weeks 1-2**: Phase 1 (foundation)
 - **Weeks 3-4**: Phase 2 (integration)
 - **Weeks 5-6**: Phase 3 (testing)
 - **Week 7**: Phase 4 (documentation)
 - **Total**: 7 weeks for full implementation + 2 weeks buffer = **9 weeks to GA**
+
+**Realistic Timeline with AI-Assisted Coding** (e.g., Claude Code, GitHub Copilot):
+
+| Phase | Traditional Estimate | AI-Assisted Estimate | Time Savings |
+|-------|---------------------|---------------------|--------------|
+| **Week 0**: Design doc, PoC | 5 days | **3 days** | -40% (AI drafts design, generates PoC) |
+| **Phase 1**: Foundation (localbackup.go, localrestore.go) | 2 weeks | **4-5 days** | -60% (AI generates boilerplate, serialization logic, unit tests) |
+| **Phase 2**: Integration (controller updates, API) | 2 weeks | **3-4 days** | -65% (AI updates handlers, generates CRD changes) |
+| **Phase 3**: Testing (E2E, failure injection) | 2 weeks | **1 week** | -50% (AI generates test scaffolds, but validation still manual) |
+| **Phase 4**: Documentation | 1 week | **2-3 days** | -60% (AI drafts docs from code) |
+| **Total** | **9 weeks** | **3-4 weeks** | **-65%** |
+
+**AI-Assisted Reality Check**: With AI code generation, Option 1 (custom backup) realistically takes **3-4 weeks**, not 9 weeks.
+
+**Revised Comparison**:
+
+| Metric | Option 1 (Custom) Traditional | **Option 1 (Custom) AI-Assisted** | Option 4B (Always-On MinIO) |
+|--------|------------------------------|-----------------------------------|---------------------------|
+| **Implementation time** | 9 weeks | **3-4 weeks** ✅ | 2-3 days |
+| **Runtime overhead** | 0s | 0s | 0s |
+| **Memory overhead** | 0 MB | 0 MB | 1 GB (0.4% of 256GB) |
+| **OADP features** | No | No | Yes |
+| **Risk** | High (new code) | High (new code) | Low (YAML only) |
+
+**Updated Decision Guidance**:
+
+**Choose Option 4B (Always-On MinIO) if:**
+- **Fastest time to production** — 2-3 days vs 3-4 weeks
+- **Need OADP features now** — Hooks, CSI snapshots
+- **Lower risk tolerance** — Proven stack vs new code
+- **Telco hardware** — 1 GB trivial on 256GB RAM
+
+**Choose Option 1 (Custom, AI-Assisted) if:**
+- **Zero dependency requirement** — Must eliminate OADP
+- **3-4 week timeline acceptable** — vs 2-3 days for Option 4B
+- **Long-term architectural purity** — Worth the extra 3 weeks
+- **Simple backup needs** — No hooks/CSI required
+- **Have AI coding tools available** — Claude Code, Copilot, etc.
 
 **Team Size**: 2 engineers (Engineer A - backup/restore logic, Engineer B - API/integration/testing), 1 QE (E2E tests), 1 tech writer (docs)
 
