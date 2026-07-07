@@ -757,45 +757,68 @@ func (h *LocalBackupHandler) CreateLocalBackup(ctx context.Context, oadpContent 
 
 ---
 
-**B: New `backupContent` Field with LCA-Native BackupSpec**
-- **Approach**: Add new `spec.backupContent` field pointing to ConfigMaps with LCA-native `BackupSpec` CRs (not Velero). Deprecate `oadpContent` over 2-3 releases.
-- **Pro**: Clean API — no Velero dependencies in schema
-- **Pro**: Can add LCA-specific features (compression, encryption, retention policies) without schema conflicts
+**B: New `backupContent` Field with LCA-Native BackupSpec** ⭐ **RECOMMENDED**
+- **Approach**: Add new `spec.backupContent` field pointing to ConfigMaps with LCA-native `BackupSpec` CRs (not Velero). Deprecate `oadpContent` over 2-3 releases. Design intuitive API specific to IBU use case, not constrained by Velero's namespace/kind/label filtering model.
+- **Pro**: **Clean, intuitive API** — Designed for IBU workflow, not generic backup/restore
+- **Pro**: **Flexible resource selection** — Support patterns beyond Velero (e.g., "all StatefulSets", "ConfigMaps matching prefix", application-level grouping)
+- **Pro**: Can add LCA-specific features (compression, encryption, retention policies, IBU-specific hooks)
 - **Pro**: Clear separation between OADP (deprecated) and local (current) modes
-- **Con**: **Breaking change** — users must update ConfigMaps with new CR format
+- **Pro**: **Product manager approval obtained** — API change approved for better UX
 - **Con**: Dual-mode support complexity during deprecation window (support both `oadpContent` and `backupContent`)
-- **Con**: More migration work for existing users (rewrite ConfigMaps)
-- **Con**: Longer implementation timeline (design new CRD, validation, tooling)
+- **Con**: More migration work for existing users (rewrite ConfigMaps, but migration tool can auto-convert)
+- **Con**: Slightly longer implementation timeline (+1 week for API design, validation, migration tool)
 
-**Example Usage**:
+**Example Usage** (Intuitive Application-Level API):
 ```yaml
-# NEW ConfigMap format with LCA-native BackupSpec
+# ConfigMap with LCA-native BackupSpec (application-focused, not namespace/kind lists)
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: lca-backup-cm
   namespace: openshift-lifecycle-agent
 data:
-  platform-backup.yaml: |
+  ibu-backup.yaml: |
     apiVersion: lca.openshift.io/v1
     kind: BackupSpec
     metadata:
-      name: acm-klusterlet
-      annotations:
-        lca.openshift.io/apply-wave: "1"
+      name: ibu-platform-and-apps
     spec:
-      includedNamespaces:
-        - open-cluster-management-agent
-      includedClusterScopedResources:
-        - group: rbac.authorization.k8s.io
-          version: v1
-          resource: clusterroles
-        - group: rbac.authorization.k8s.io
-          version: v1
-          resource: clusterrolebindings
-      # NEW: local-specific options
-      compression: gzip
-      encryption: false
+      # Platform resources (cluster-scoped, high-level toggles)
+      platform:
+        includeACM: true      # Backs up ACM klusterlet automatically
+        includeLVMS: true     # Backs up LVMS config automatically
+        customResources:      # Additional platform CRs if needed
+          - group: operators.coreos.com
+            version: v1alpha1
+            resource: subscriptions
+            names: ["my-operator"]  # Specific subscription only
+      
+      # Application resources (namespace-scoped, intuitive grouping)
+      applications:
+        - name: monitoring
+          namespaces:
+            - openshift-monitoring
+            - openshift-user-workload-monitoring
+          resources:  # Simple strings, not GVR tuples
+            - configmaps
+            - secrets
+            - prometheusrules
+          labelSelector:
+            matchLabels:
+              app: prometheus
+        
+        - name: user-app
+          namespaces:
+            - my-app
+          # Empty resources = backup everything in namespace
+          excludeNames:
+            - "*-cache-*"  # Exclude cache ConfigMaps
+      
+      # Backup options
+      options:
+        wave: 1
+        compression: gzip  # Enable compression for this backup
+        encryptAtRest: false
 
 # IBU CR with NEW field
 apiVersion: lca.openshift.io/v1
@@ -804,7 +827,6 @@ metadata:
   name: upgrade
 spec:
   stage: Upgrade
-  backupMode: local
   backupContent:  # NEW field (replaces oadpContent)
     - name: lca-backup-cm
       namespace: openshift-lifecycle-agent
@@ -812,13 +834,21 @@ spec:
     image: quay.io/seed:4.16
 ```
 
-**API Changes** (`api/imagebasedupgrade/v1/types.go`):
+**Why This API is Better for IBU**:
+- **Application-centric**: Users think "backup my app" not "backup these 10 GVRs across 3 namespaces"
+- **High-level toggles**: `includeACM: true` is clearer than listing 15 ACM resource types
+- **Simple resource names**: `"deployments"` not `{group: "apps", version: "v1", resource: "deployments"}`
+- **Built-in IBU knowledge**: ACM and LVMS are common in IBU, so first-class support
+- **Glob patterns**: `excludeNames: ["*-cache-*"]` for intuitive filtering
+- **Label selectors**: Reuses familiar Kubernetes LabelSelector (not custom Velero format)
+
+**API Design** (`api/imagebasedupgrade/v1/types.go`):
 ```go
 type ImageBasedUpgradeSpec struct {
     Stage ImageBasedUpgradeStage `json:"stage,omitempty"`
     SeedImageRef SeedImageRef `json:"seedImageRef,omitempty"`
     
-    // DEPRECATED: Use backupContent instead
+    // DEPRECATED: Use backupContent instead (removed in v2.0)
     // +optional
     OADPContent []ConfigMapRef `json:"oadpContent,omitempty"`
     
@@ -826,15 +856,12 @@ type ImageBasedUpgradeSpec struct {
     // +optional
     BackupContent []ConfigMapRef `json:"backupContent,omitempty"`
     
-    // +kubebuilder:validation:Enum=local;oadp
-    // +kubebuilder:default=local
-    BackupMode string `json:"backupMode,omitempty"`
-    
     ExtraManifests []ConfigMapRef `json:"extraManifests,omitempty"`
     AutoRollbackOnFailure *AutoRollbackOnFailure `json:"autoRollbackOnFailure,omitempty"`
 }
 
 // BackupSpec defines LCA-native backup specification
+// Designed for IBU use case: intuitive application-level grouping, not Velero's namespace/kind filtering
 type BackupSpec struct {
     metav1.TypeMeta   `json:",inline"`
     metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -842,19 +869,85 @@ type BackupSpec struct {
 }
 
 type BackupSpecSpec struct {
-    IncludedNamespaces []string `json:"includedNamespaces,omitempty"`
-    ExcludedNamespaces []string `json:"excludedNamespaces,omitempty"`
-    IncludedClusterScopedResources []ResourceIdentifier `json:"includedClusterScopedResources,omitempty"`
-    ExcludedResources []string `json:"excludedResources,omitempty"`
-    // Local-specific options
-    Compression string `json:"compression,omitempty"` // none, gzip, zstd
-    Encryption bool `json:"encryption,omitempty"`
+    // Applications defines high-level application groupings to backup
+    // Each application can span multiple namespaces and resource types
+    // +optional
+    Applications []ApplicationBackup `json:"applications,omitempty"`
+    
+    // Platform defines platform-level resources (cluster-scoped, operators)
+    // +optional
+    Platform *PlatformBackup `json:"platform,omitempty"`
+    
+    // Options for backup behavior
+    // +optional
+    Options BackupOptions `json:"options,omitempty"`
 }
 
-type ResourceIdentifier struct {
+// ApplicationBackup defines resources for a single application
+type ApplicationBackup struct {
+    // Name of the application (e.g., "acm", "prometheus", "user-app")
+    Name string `json:"name"`
+    
+    // Namespaces where this application runs
+    // +optional
+    Namespaces []string `json:"namespaces,omitempty"`
+    
+    // Resources to backup (simple string format: "deployments", "statefulsets", "configmaps")
+    // Empty means "all resources in namespaces"
+    // +optional
+    Resources []string `json:"resources,omitempty"`
+    
+    // LabelSelector to filter resources within namespaces
+    // +optional
+    LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
+    
+    // Exclude specific resources by name pattern (glob supported)
+    // +optional
+    ExcludeNames []string `json:"excludeNames,omitempty"`
+}
+
+// PlatformBackup defines cluster-scoped platform resources
+type PlatformBackup struct {
+    // IncludeACM backs up ACM/MCE klusterlet resources
+    // +optional
+    IncludeACM bool `json:"includeACM,omitempty"`
+    
+    // IncludeLVMS backs up LVMS configuration (LVMCluster, LVMVolumeGroup)
+    // +optional
+    IncludeLVMS bool `json:"includeLVMS,omitempty"`
+    
+    // CustomResources defines additional cluster-scoped resources by GVR
+    // +optional
+    CustomResources []GroupVersionResource `json:"customResources,omitempty"`
+}
+
+// GroupVersionResource identifies a Kubernetes resource type
+type GroupVersionResource struct {
     Group string `json:"group,omitempty"`
     Version string `json:"version"`
     Resource string `json:"resource"`
+    
+    // Names filters specific resources (empty = all)
+    // +optional
+    Names []string `json:"names,omitempty"`
+}
+
+// BackupOptions defines backup behavior
+type BackupOptions struct {
+    // Wave for restore ordering (lower waves restored first)
+    // +optional
+    // +kubebuilder:validation:Minimum=1
+    Wave int `json:"wave,omitempty"`
+    
+    // Compression algorithm (none, gzip, zstd)
+    // +optional
+    // +kubebuilder:validation:Enum=none;gzip;zstd
+    // +kubebuilder:default=none
+    Compression string `json:"compression,omitempty"`
+    
+    // EncryptAtRest encrypts backup files (future enhancement)
+    // +optional
+    EncryptAtRest bool `json:"encryptAtRest,omitempty"`
 }
 ```
 
@@ -863,9 +956,42 @@ type ResourceIdentifier struct {
 - **v1.3** (week 13+): Deprecation warning when `oadpContent` used
 - **v2.0** (6 months): Remove `oadpContent`, only `backupContent` supported
 
+**Migration Tool** (`lca-cli migrate-backup-config`):
+Auto-converts Velero Backup CRs to LCA BackupSpec:
+```bash
+# Convert existing OADP ConfigMap to LCA format
+lca-cli migrate-backup-config \
+  --from-configmap oadp-cm \
+  --from-namespace openshift-adp \
+  --to-configmap lca-backup-cm \
+  --to-namespace openshift-lifecycle-agent
+
+# Validates conversion, shows diff, prompts for confirmation
+# Detects ACM/LVMS patterns and converts to platform.includeACM/includeLVMS
+# Converts namespace lists to application groupings
+```
+
 **Trade-offs:**
-- **Gain**: API purity, flexibility for future features, clear deprecation path
-- **Give up**: Backward compatibility (requires migration), faster time to value
+- **Gain**: Intuitive IBU-specific API, flexibility for future features, better UX than Velero schema
+- **Give up**: Initial migration effort (mitigated by auto-conversion tool)
+
+---
+
+**Recommendation**: **Option B (LCA-Native BackupSpec)** ⭐
+
+**Rationale**:
+1. **Going with Option 1 (custom backup)** — Not using OADP, so no need to preserve Velero compatibility
+2. **Product manager approval** — API change approved, can design ideal API for IBU
+3. **Better long-term UX** — Application-centric API is more intuitive than namespace/GVR lists
+4. **AI-assisted migration** — Can generate auto-conversion tool quickly
+5. **3-4 week timeline** — Includes API design, validation, migration tool, testing
+
+**Implementation adds ~1 week** for:
+- API design and CRD generation: 2 days
+- Migration tool (`lca-cli migrate-backup-config`): 2-3 days
+- Validation and testing: 2 days
+
+**Total**: 3-4 weeks (Option 1 timeline) + 1 week (API design) = **4-5 weeks with AI assistance**
 
 ---
 
